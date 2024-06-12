@@ -58,6 +58,7 @@ def main(
 
     tokenizer = load_hf_tokenizer(pretrained_model_name_or_path=(local_model_dir if local_model_dir else model_name), cache_dir=cache_dir, hf_token=hf_token, local_model_dir=local_model_dir)
 
+
     qpc_path_exists, qpc_dir_path = qpc_exists(model_name, qpc_base_dir_name)
     # Handle qpc generation
     if qpc_path_exists:
