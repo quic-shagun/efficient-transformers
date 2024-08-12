@@ -31,7 +31,7 @@ from transformers.trainer import TRAINER_STATE_NAME
 from transformers.trainer_callback import ExportableState, TrainerState
 from transformers.trainer_utils import HPSearchBackend, TrainOutput, has_length, speed_metrics
 
-from QEfficient.training.onnx_transforms import InputsToInitTransform
+from QEfficient.training.onnx_transforms import AddTrainingOpsTransform, InputsToInitTransform
 
 from .qaic_infer import QAICInferenceSession
 from .training_ops import custom_opset, dynamic_functions, functions
@@ -390,20 +390,10 @@ class QEffTrainer(Trainer):
         self.train_onnx_path, self.eval_onnx_path = self._generate_artifacts()
         logger.debug("Backward graph generated")
 
+        # Fix, Validate and Save training model
         train_onnx = onnx.load(self.train_onnx_path, load_external_data=False)
         train_onnx, transformed = InputsToInitTransform.apply(train_onnx, self.model_onnx_path, self.frozen_params)
-        eval_onnx = onnx.load(self.eval_onnx_path, load_external_data=False)
-        eval_onnx, transformed = InputsToInitTransform.apply(eval_onnx, self.eval_onnx_path, self.frozen_params)
-
-        custom_ops = {
-            x.domain + "::" + x.op_type for x in train_onnx.graph.node if x.domain != "" and x.domain != "ai.onnx"
-        }
-        if custom_ops:
-            logger.debug("Training custom ops:")
-            logger.debug("\n".join(sorted(custom_ops)))
-
-        # Fix, Validate and Save training model
-        train_onnx = self._fix_training_ops(train_onnx)
+        train_onnx, transformed = AddTrainingOpsTransform.apply(train_onnx)
         if self.args.validate:
             train_onnx_tmp_path = os.path.join(self.args.output_dir, "training_model_tmp.onnx")
             onnx.save(train_onnx, train_onnx_tmp_path)
@@ -427,7 +417,8 @@ class QEffTrainer(Trainer):
 
         # Fix, Validate and Save eval model
         eval_onnx = onnx.load(self.eval_onnx_path, load_external_data=False)
-        eval_onnx = self._fix_training_ops(eval_onnx)
+        eval_onnx, transformed = InputsToInitTransform.apply(eval_onnx, self.eval_onnx_path, self.frozen_params)
+        eval_onnx, transformed = AddTrainingOpsTransform.apply(eval_onnx)
         if self.args.validate:
             eval_onnx_tmp_path = os.path.join(self.args.output_dir, "eval_model_tmp.onnx")
             onnx.save(eval_onnx, eval_onnx_tmp_path)
