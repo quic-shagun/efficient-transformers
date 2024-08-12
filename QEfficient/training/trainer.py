@@ -31,6 +31,8 @@ from transformers.trainer import TRAINER_STATE_NAME
 from transformers.trainer_callback import ExportableState, TrainerState
 from transformers.trainer_utils import HPSearchBackend, TrainOutput, has_length, speed_metrics
 
+from QEfficient.training.onnx_transforms import InputsToInitTransform
+
 from .qaic_infer import QAICInferenceSession
 from .training_ops import custom_opset, dynamic_functions, functions
 
@@ -388,10 +390,11 @@ class QEffTrainer(Trainer):
         self.train_onnx_path, self.eval_onnx_path = self._generate_artifacts()
         logger.debug("Backward graph generated")
 
-        self._frozen_params_to_inits(self.train_onnx_path)
-        self._frozen_params_to_inits(self.eval_onnx_path)
-
         train_onnx = onnx.load(self.train_onnx_path, load_external_data=False)
+        train_onnx, transformed = InputsToInitTransform.apply(train_onnx, self.model_onnx_path, self.frozen_params)
+        eval_onnx = onnx.load(self.eval_onnx_path, load_external_data=False)
+        eval_onnx, transformed = InputsToInitTransform.apply(eval_onnx, self.eval_onnx_path, self.frozen_params)
+
         custom_ops = {
             x.domain + "::" + x.op_type for x in train_onnx.graph.node if x.domain != "" and x.domain != "ai.onnx"
         }
@@ -511,29 +514,6 @@ class QEffTrainer(Trainer):
         return os.path.join(self.args.output_dir, "training_model.onnx"), os.path.join(
             self.args.output_dir, "eval_model.onnx"
         )
-
-    def _frozen_params_to_inits(self, backward_onnx_path: str):
-        forward_model = onnx.load(self.model_onnx_path, load_external_data=False)
-        params = {init.name: init for init in forward_model.graph.initializer}
-        backward_model = onnx.load(backward_onnx_path, load_external_data=False)
-
-        assert self.frozen_params.issubset(
-            {x.name for x in backward_model.graph.input}
-        ), "Frozen params missing as inputs in backward model"
-        assert self.frozen_params.issubset(params.keys()), "Frozen params missing as initializers in forward model"
-        inputs = []
-        for inp in backward_model.graph.input:
-            if inp.name in self.frozen_params:
-                param = onnx.TensorProto()
-                param.CopyFrom(params[inp.name])
-                backward_model.graph.initializer.append(param)
-            else:
-                inputs.append(inp)
-
-        del backward_model.graph.input[:]
-        backward_model.graph.input.extend(inputs)
-
-        onnx.save(backward_model, backward_onnx_path)
 
     def _fix_training_ops(self, model: onnx.ModelProto) -> onnx.ModelProto:
         # Set onnx base opset to 17 where LayerNormalization is present
