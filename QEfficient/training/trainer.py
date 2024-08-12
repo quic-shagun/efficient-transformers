@@ -31,10 +31,9 @@ from transformers.trainer import TRAINER_STATE_NAME
 from transformers.trainer_callback import ExportableState, TrainerState
 from transformers.trainer_utils import HPSearchBackend, TrainOutput, has_length, speed_metrics
 
-from QEfficient.training.onnx_transforms import AddTrainingOpsTransform, InputsToInitTransform
+from QEfficient.training.onnx_transforms import AddOptimizerTransform, AddTrainingOpsTransform, InputsToInitTransform
 
 from .qaic_infer import QAICInferenceSession
-from .training_ops import custom_opset, dynamic_functions, functions
 
 logger = logging.getLogger(__name__)
 
@@ -399,7 +398,7 @@ class QEffTrainer(Trainer):
             onnx.save(train_onnx, train_onnx_tmp_path)
             self._validate_with_onnxrt(self.train_onnx_path, train_onnx_tmp_path, sample_input, training=True)
             os.remove(train_onnx_tmp_path)
-        train_onnx = self._fix_aic_only(train_onnx)
+        train_onnx = AddOptimizerTransform.apply(train_onnx)
         train_onnx = onnx.shape_inference.infer_shapes(train_onnx, True, True, True)
         self.train_onnx_path = os.path.join(self.args.output_dir, "training_model_modified.onnx")
         onnx.save(train_onnx, self.train_onnx_path)
@@ -407,7 +406,6 @@ class QEffTrainer(Trainer):
         retained_inputs = {
             x.name[: -len("_RetainedState")] for x in train_onnx.graph.output if x.name.endswith("_RetainedState")
         }
-        assert retained_inputs.issubset({x.name for x in train_onnx.graph.input})
         del train_onnx
         self.custom_io_train_path = os.path.join(self.args.output_dir, "custom_io_train.yaml")
         with open(self.custom_io_train_path, "w") as fp:
@@ -506,57 +504,6 @@ class QEffTrainer(Trainer):
             self.args.output_dir, "eval_model.onnx"
         )
 
-    def _fix_training_ops(self, model: onnx.ModelProto) -> onnx.ModelProto:
-        # Set onnx base opset to 17 where LayerNormalization is present
-        next(x for x in model.opset_import if x.domain == "").version = 17
-
-        # Add ONNXScript functions
-        model_function_names = set()
-        model_functions = []
-
-        # Graph modifications
-        inputs = {inp.name: inp for inp in model.graph.input}
-        outputs = {out.name: out for out in model.graph.output}
-        value_info = {vi.name: vi for vi in model.graph.value_info}
-        for node in model.graph.node:
-            if node.op_type in functions:
-                node.domain = custom_opset.domain
-                if node.op_type not in model_function_names:
-                    model_functions.append(functions[node.op_type].to_function_proto())
-                    model_function_names.add(node.op_type)
-
-                if node.op_type == "InPlaceAccumulatorV2":
-                    # Replace bool outputs with float of same size as accumulation buffer
-                    for out_name, out in outputs.items():
-                        if out_name.endswith("accumulation.out"):
-                            out.type.CopyFrom(inputs[out.name[: -len("out")] + "buffer"].type)
-
-                elif node.op_type == "LayerNormalizationGrad":
-                    # Remove the saved mean and variance inputs
-                    node.input.pop()
-                    node.input.pop()
-
-            elif node.op_type in dynamic_functions:
-                node.domain = custom_opset.domain
-                node_inputs = [value_info[x] if x in value_info else x for x in node.input]
-                node_attributes = {a.name: onnx.helper.get_attribute_value(a) for a in node.attribute}
-                fn_key, fn = dynamic_functions[node.op_type](*node_inputs, **node_attributes)
-                node.op_type += fn_key
-                if node.op_type not in model_function_names:
-                    model_functions.append(fn.to_function_proto())
-                    model_function_names.add(node.op_type)
-
-        # Add required functions
-        model.functions.extend(model_functions)
-
-        # Add custom domain
-        model.opset_import.append(onnx.helper.make_opsetid(custom_opset.domain, custom_opset.version))
-
-        # Inline functions known to cause errors when run as functions
-        model = onnx.inliner.inline_selected_functions(model, [("com.qualcomm.cloud", "SoftmaxCrossEntropyLoss")])
-
-        return model
-
     def _validate_with_onnxrt(
         self, model_orig_path: str, model_fixed_path: str, inputs: Dict[str, torch.Tensor], training: bool
     ):
@@ -586,33 +533,6 @@ class QEffTrainer(Trainer):
                     print(name, diff)
 
         return passed
-
-    def _fix_aic_only(self, model: onnx.ModelProto) -> onnx.ModelProto:
-        # Remove grad acc inputs
-        for i, inp in reversed(list(enumerate(model.graph.input))):
-            if inp.name.endswith("_grad.accumulation.buffer"):
-                model.graph.input.pop(i)
-
-        # Replace grad acc outputs with retained-state weights
-        for out in model.graph.output:
-            if out.name.endswith("grad.accumulation.out"):
-                out.name = out.name.replace("grad.accumulation.out", "RetainedState")
-
-        optimizer_name = type(self.optimizer).__name__
-        # Graph modifications
-        for node in model.graph.node:
-            if node.op_type == "InPlaceAccumulatorV2":
-                # Replace InPlaceAccumulator with optimizer
-                node.op_type = optimizer_name
-                node.input.pop(-1)  # Remove lazy_reset_grad
-                node.input[0] = node.input[0][: -len("_grad.accumulation.buffer")]
-                node.output[0] = node.output[0].replace("grad.accumulation.out", "RetainedState")
-
-        # Add optimizer to the model
-        model.functions.remove(functions["InPlaceAccumulatorV2"].to_function_proto())
-        model.functions.append(functions[optimizer_name].to_function_proto())
-
-        return model
 
     def _compile_models(self):
         os.makedirs(self.args.qpc_path, exist_ok=True)

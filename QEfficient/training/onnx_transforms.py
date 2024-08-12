@@ -15,6 +15,10 @@ from QEfficient.training.training_ops import aisw_opset, cloud_opset, dynamic_fu
 
 
 class InputsToInitTransform(OnnxTransform):
+    """
+    Converts inputs into initializers, copying from a reference model.
+    """
+
     @classmethod
     def apply(
         cls, model: ModelProto, reference_model_path: str, input_names: Set, onnx_base_dir: Optional[str] = None
@@ -46,6 +50,10 @@ class InputsToInitTransform(OnnxTransform):
 
 
 class AddTrainingOpsTransform(OnnxTransform):
+    """
+    Add required training ops into the model
+    """
+
     @classmethod
     def apply(cls, model: ModelProto, onnx_base_dir: Optional[str] = None) -> Tuple[ModelProto, bool]:
         model_function_names = set()
@@ -102,5 +110,47 @@ class AddTrainingOpsTransform(OnnxTransform):
 
             # Inline functions known to cause errors when run as functions
             model = onnx.inliner.inline_selected_functions(model, [("com.qualcomm.cloud", "SoftmaxCrossEntropyLoss")])
+
+        return model, transformed
+
+
+class AddOptimizerTransform(OnnxTransform):
+    """
+    Adds specified optimizer into the model
+    """
+
+    @classmethod
+    def apply(cls, model: ModelProto, optimizer: str, onnx_base_dir: Optional[str] = None) -> Tuple[ModelProto, bool]:
+        transformed = False
+
+        # Remove grad acc inputs
+        for i, inp in reversed(list(enumerate(model.graph.input))):
+            if inp.name.endswith("_grad.accumulation.buffer"):
+                transformed = True
+                model.graph.input.pop(i)
+
+        # Replace grad acc outputs with retained-state weights
+        for out in model.graph.output:
+            if out.name.endswith("grad.accumulation.out"):
+                transformed = True
+                out.name = out.name.replace("grad.accumulation.out", "RetainedState")
+
+        # Replace InPlaceAccumulator with optimizer
+        for node in model.graph.node:
+            if node.op_type == "InPlaceAccumulatorV2":
+                transformed = True
+                node.op_type = optimizer
+                node.input.pop(-1)  # Remove lazy_reset_grad
+                node.input.append("lr")
+                node.input[0] = node.input[0][: -len("_grad.accumulation.buffer")]
+                node.output[0] = node.output[0].replace("grad.accumulation.out", "RetainedState")
+
+        if transformed:
+            # Add lr input
+            model.graph.input.append(onnx.helper.make_tensor_value_info("lr", 1, []))
+
+            # Add optimizer to the model
+            model.functions.remove(functions["InPlaceAccumulatorV2"].to_function_proto())
+            model.functions.append(functions[optimizer].to_function_proto())
 
         return model, transformed
