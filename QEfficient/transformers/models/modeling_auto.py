@@ -13,7 +13,7 @@ from transformers import AutoModel, AutoModelForCausalLM, PreTrainedTokenizer, P
 
 import QEfficient
 from QEfficient.base.modeling_qeff import QEFFBaseModel, Runtime
-from QEfficient.transformers.pytorch_transforms import CustomOpsTransform, KVCacheTransform
+from QEfficient.transformers.pytorch_transforms import CustomOpsTransform, InitTransform, KVCacheTransform
 from QEfficient.utils import get_qpc_dir_path, load_hf_tokenizer
 from QEfficient.utils.logging_utils import logger
 
@@ -95,7 +95,7 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
     QEFF class for manipulating any causal language model from HuggingFace hub.
     """
 
-    _pytorch_transforms = [CustomOpsTransform, KVCacheTransform]
+    _pytorch_transforms = [CustomOpsTransform, KVCacheTransform, InitTransform]
 
     def transform(self):
         if self.is_transformed:
